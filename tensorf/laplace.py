@@ -2,19 +2,17 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Tuple, Optional, Union
+from typing import Tuple, Optional
 
 import fifteen
-import flax
 import jax
 import jax_dataclasses as jdc
 import tree_math as tm
-import optax
 from jax import numpy as jnp
 from tqdm.auto import tqdm
 from typing_extensions import Annotated, assert_never
 
-from . import data, networks, render, tensor_vm, train_config, utils
+from . import data, networks, render, train_config
 from tensorf.training import TrainState
 
 def random_split_like_tree(rng_key, target=None, treedef=None):

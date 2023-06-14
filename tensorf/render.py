@@ -10,6 +10,7 @@ import jax
 import jax_dataclasses as jdc
 import numpy as onp
 from jax import numpy as jnp
+import tree_math as tm
 from tqdm.auto import tqdm
 from typing_extensions import Annotated
 
@@ -225,50 +226,51 @@ def render_rays(
         sigmas = jax.nn.softplus(jnp.sum(density_feat, axis=0) + 10.0)
         assert sigmas.shape == (ray_count, config.density_samples_per_ray)
     else:        
-        if config.linearized_laplace:
-            
-            def f(x, params):
-                return params.interpolate(x)
+        
+        for i in range(config.n_samples):
+            sample_prng_key = jax.random.split(sample_prng_key)[0]
+            sampled_density_tensor = jax.tree_map(lambda x, y: x + 1.0/(jnp.sqrt(jax.nn.relu(y)) + 1.0) \
+                                                    * jax.random.normal(sample_prng_key, 
+                                                                        shape=x.shape, 
+                                                                        dtype=x.dtype), 
+                                                    learnable_params.density_tensor, 
+                                                    hessian_params.density_tensor) 
 
-            lmbd = lambda p: f(points, p)
-            pred, f_l = jax.linearize(lmbd, learnable_params.density_tensor)
+            if config.linearized_laplace:
 
-            
+                def f(x, params):
+                    return params.interpolate(x)
 
-        else: # mc sampling
-            for i in range(config.n_samples):
-                sample_prng_key = jax.random.split(sample_prng_key)[0]
-                sampled_density_tensor = jax.tree_map(lambda x, y: x + 1.0/(jnp.sqrt(jax.nn.relu(y)) + 1.0) \
-                                                      * jax.random.normal(sample_prng_key, 
-                                                                          shape=x.shape, 
-                                                                          dtype=x.dtype), 
-                                                      learnable_params.density_tensor, 
-                                                      hessian_params.density_tensor) 
-
+                centered_sample = (tm.Vector(sampled_density_tensor) - tm.Vector(learnable_params.density_tensor)).tree
+                lmbd = lambda p: f(points, p)
+                pred, f_l = jax.linearize(lmbd, learnable_params.density_tensor)
+                # linearized prediction
+                density_feat = pred + f_l(centered_sample)
+            else: 
                 density_feat = sampled_density_tensor.interpolate(points)
-                
-                assert density_feat.shape == (
-                    density_feat.shape[0],
-                    ray_count,
-                    config.density_samples_per_ray,
-                )
+                        
+            assert density_feat.shape == (
+                density_feat.shape[0],
+                ray_count,
+                config.density_samples_per_ray,
+            )
 
-                # Density from features.
-                sigmas = jax.nn.softplus(jnp.sum(density_feat, axis=0) + 10.0)
-                assert sigmas.shape == (ray_count, config.density_samples_per_ray)
+            # Density from features.
+            sigmas = jax.nn.softplus(jnp.sum(density_feat, axis=0) + 10.0)
+            assert sigmas.shape == (ray_count, config.density_samples_per_ray)
 
-                if i == 0:
-                    sigmas_sum = sigmas
-                    sigmas_sum2 = sigmas**2
-                else:
-                    sigmas_sum += sigmas
-                    sigmas_sum2 += sigmas**2
+            if i == 0:
+                sigmas_sum = sigmas
+                sigmas_sum2 = sigmas**2
+            else:
+                sigmas_sum += sigmas
+                sigmas_sum2 += sigmas**2
 
-            sigmas = sigmas_sum / config.n_samples
-            sigmas2 = sigmas_sum2 / config.n_samples
-            sigma_var = sigmas2 - sigmas**2
+        sigmas = sigmas_sum / config.n_samples
+        sigmas2 = sigmas_sum2 / config.n_samples
+        sigma_var = sigmas2 - sigmas**2
 
-            assert sigma_var.shape == (ray_count, config.density_samples_per_ray)
+        assert sigma_var.shape == (ray_count, config.density_samples_per_ray)
 
     # Compute segment probabilities for each ray.
     probs = compute_segment_probabilities(sigmas, step_sizes)

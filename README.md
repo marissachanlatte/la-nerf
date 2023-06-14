@@ -71,7 +71,8 @@ dataset:
    python ./render_360.py --help
    python ./render_360.py --run-dir "runs/lego-2023-06-13-12:29:08" --mode "RGB" --output-dir "renders/lego/rgb"
   python ./render_360.py --run-dir "runs/lego-2023-06-13-12:29:08" --mode "DIST_MEDIAN" --output-dir "renders/lego/dist_median"
-  python ./render_360.py --run-dir "runs/lego-2023-06-13-12:29:08" --mode "UNCERTAINTIES_DENSITIES" --output-dir "renders/lego/uncertainties_densities"
+  python ./render_360.py --run-dir "runs/lego-2023-06-13-12:29:08" --mode "UNCERTAINTIES_DENSITIES" --output-dir "renders/lego/uncertainties_densities" --laplace
+  python ./render_360.py --run-dir "runs/lego-2023-06-13-12:29:08" --mode "UNCERTAINTIES_DENSITIES" --output-dir "renders/lego/uncertainties_densities_linearized_laplace" --laplace --linearized-laplace
    ```
 
 ## Render uncertainties

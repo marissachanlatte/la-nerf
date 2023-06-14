@@ -58,6 +58,8 @@ class Args:
 
     rotation_axis: Literal["world_z", "camera_up"] = "camera_up"
 
+    laplace: bool = False
+
     linearized_laplace: bool = False
     """Whether to use the linearized Laplace approximation or MC."""
 
@@ -82,14 +84,18 @@ def main(args: Args) -> None:
     train_state = experiment.restore_checkpoint(train_state)
     assert train_state.step > 0
 
-    hessian_experiment = fifteen.experiments.Experiment(data_dir=config.run_dir / "hessian")
-    hessian_state = tensorf.laplace.HessianState.initialize(
-        config,
-        learnable_params=train_state.learnable_params,
-        num_cameras=experiment.read_metadata("num_cameras", int),
-        prng_key=jax.random.PRNGKey(94709),
-    )
-    hessian_state = hessian_experiment.restore_checkpoint(hessian_state)
+    if args.laplace:
+        hessian_experiment = fifteen.experiments.Experiment(data_dir=config.run_dir / "hessian")
+        hessian_state = tensorf.laplace.HessianState.initialize(
+            config,
+            learnable_params=train_state.learnable_params,
+            num_cameras=experiment.read_metadata("num_cameras", int),
+            prng_key=jax.random.PRNGKey(94709),
+        )
+        hessian_state = hessian_experiment.restore_checkpoint(hessian_state)
+        hessian_estimate = hessian_state.JtJe
+    else:
+        hessian_estimate = None
 
     # Load the training dataset... we're only going to use this to grab a camera.
     dataset = tensorf.data.make_dataset(
@@ -140,7 +146,7 @@ def main(args: Args) -> None:
         rendered = tensorf.render.render_rays_batched(
             appearance_mlp=train_state.appearance_mlp,
             learnable_params=train_state.learnable_params,
-            hessian_params=hessian_state.JtJe,
+            hessian_params=hessian_estimate,
             aabb=train_state.aabb,
             rays_wrt_world=camera.pixel_rays_wrt_world(
                 camera_index=args.render_camera_index
