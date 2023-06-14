@@ -63,7 +63,6 @@ dataset:
     ```bash
     python ./posthoc_lego.py --config.run-dir "runs/lego-2023-06-13-12:29:08"
     ```
-# TODO: implement with non-linearized volume rendering
 
 6. To render:
 
