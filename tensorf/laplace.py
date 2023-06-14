@@ -59,9 +59,6 @@ class HessianState(jdc.EnforcedAnnotationsMixin):
     # hessian
     JtJe: render.LearnableParams
 
-    # linearized laplace
-    # linearized_laplace : Optional[bool] = False
-
     @staticmethod
     @jdc.jit
     def initialize(
@@ -158,8 +155,6 @@ class HessianState(jdc.EnforcedAnnotationsMixin):
                 return (tm.Vector(eps) * tm.Vector(f_lt_tuple(f_l(eps))[0])).tree
             JtJe = jax.vmap(diag_est)(eps)
             JtJe = jax.tree_map(lambda t: jnp.mean(t, axis=0), JtJe)
-            # ggn_diag = jax.tree_map(lambda x: jnp.reshape(x, (-1,)), JtJe)
-            # ggn_diag = jnp.concatenate(jax.tree_util.tree_flatten(ggn_diag)[0], axis=-1)
             return JtJe
 
         JtJe = estimate_diag_ggn(

@@ -226,13 +226,26 @@ def render_rays(
         assert sigmas.shape == (ray_count, config.density_samples_per_ray)
     else:        
         if config.linearized_laplace:
-            pass
+            
+            def f(x, params):
+                return params.interpolate(x)
+
+            lmbd = lambda p: f(points, p)
+            pred, f_l = jax.linearize(lmbd, learnable_params.density_tensor)
+
+            
 
         else: # mc sampling
             for i in range(config.n_samples):
                 sample_prng_key = jax.random.split(sample_prng_key)[0]
-                sampled_params = jax.tree_map(lambda x, y: x + 1.0/(jnp.sqrt(jax.nn.relu(y)) + 1e-6) * jax.random.normal(sample_prng_key, shape=x.shape, dtype=x.dtype), learnable_params, hessian_params) 
-                density_feat = sampled_params.density_tensor.interpolate(points)
+                sampled_density_tensor = jax.tree_map(lambda x, y: x + 1.0/(jnp.sqrt(jax.nn.relu(y)) + 1.0) \
+                                                      * jax.random.normal(sample_prng_key, 
+                                                                          shape=x.shape, 
+                                                                          dtype=x.dtype), 
+                                                      learnable_params.density_tensor, 
+                                                      hessian_params.density_tensor) 
+
+                density_feat = sampled_density_tensor.interpolate(points)
                 
                 assert density_feat.shape == (
                     density_feat.shape[0],
