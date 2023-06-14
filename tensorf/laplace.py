@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Tuple
+from typing import Tuple, Optional, Union
 
 import fifteen
 import flax
@@ -56,8 +56,11 @@ class HessianState(jdc.EnforcedAnnotationsMixin):
     prng_key: jax.random.KeyArray
     step: Annotated[jnp.ndarray, jnp.integer, ()]
 
-    # currently hard-coded, but should be based on the number of parameters
-    ggn_diag: jnp.ndarray = jnp.zeros((17377715,))
+    # hessian
+    JtJe: render.LearnableParams
+
+    # linearized laplace
+    # linearized_laplace : Optional[bool] = False
 
     @staticmethod
     @jdc.jit
@@ -84,6 +87,7 @@ class HessianState(jdc.EnforcedAnnotationsMixin):
             config=config,
             appearance_mlp=appearance_mlp,
             learnable_params=learnable_params,
+            JtJe=jax.tree_map(lambda x: x * 0, learnable_params), # initalize with zeros
             aabb=jnp.array([config.initial_aabb_min, config.initial_aabb_max]),
             prng_key=prng_keys[4],
             step=jnp.array(0),
@@ -147,17 +151,18 @@ class HessianState(jdc.EnforcedAnnotationsMixin):
         def estimate_diag_ggn(model_fn, minibatch, params, key: jax.random.PRNGKeyArray, S: int = 50):
             eps = tree_random_normal_like(key, params, n_samples=S)
             lmbd = lambda p: model_fn(minibatch, p)
+
             _, f_l = jax.linearize(lmbd, params)
             f_lt_tuple = jax.linear_transpose(f_l, params)
             def diag_est(eps): 
                 return (tm.Vector(eps) * tm.Vector(f_lt_tuple(f_l(eps))[0])).tree
             JtJe = jax.vmap(diag_est)(eps)
             JtJe = jax.tree_map(lambda t: jnp.mean(t, axis=0), JtJe)
-            ggn_diag = jax.tree_map(lambda x: jnp.reshape(x, (-1,)), JtJe)
-            ggn_diag = jnp.concatenate(jax.tree_util.tree_flatten(ggn_diag)[0], axis=-1)
-            return ggn_diag
+            # ggn_diag = jax.tree_map(lambda x: jnp.reshape(x, (-1,)), JtJe)
+            # ggn_diag = jnp.concatenate(jax.tree_util.tree_flatten(ggn_diag)[0], axis=-1)
+            return JtJe
 
-        ggn_diag = estimate_diag_ggn(
+        JtJe = estimate_diag_ggn(
             render_rays, 
             minibatch, 
             learnable_params, 
@@ -165,15 +170,11 @@ class HessianState(jdc.EnforcedAnnotationsMixin):
         )
 
         with jdc.copy_and_mutate(self, validate=True) as new_state:
-            # import pdb; pdb.set_trace()
-            # add = lambda p, u: jnp.asarray(p + u).astype(jnp.asarray(p).dtype)
-            # new_state.ggn_diag = add(new_state.ggn_diag, ggn_diag)
-            # new_state.ggn_diag = new_state.ggn_diag + ggn_diag.copy()
-            # new_state.ggn_diag = ggn_diag
-            new_state.ggn_diag = new_state.ggn_diag
+
+            new_state.JtJe = jax.tree_map(lambda a,b: a+b, new_state.JtJe, JtJe)
             new_state.prng_key = new_prng_key
             new_state.step = new_state.step + 1
-        return new_state, ggn_diag #, log_data.prefix("fit/")
+        return new_state #, log_data.prefix("fit/")
 
 
 def fit_laplace(
@@ -183,9 +184,14 @@ def fit_laplace(
 
     # Set up our experiment: for checkpoints, logs, metadata, etc.
     experiment = fifteen.experiments.Experiment(data_dir=config.run_dir)
-    
     experiment.assert_exists()
     config = experiment.read_metadata("config", train_config.TensorfConfig)
+
+    # create hessian experiment for saving hessian data
+    hessian_experiment = fifteen.experiments.Experiment(data_dir=config.run_dir / "hessian")
+
+    # only works with mini batch size 1...
+    minibatch_size = 1
 
     # Load dataset.
     dataset = data.make_dataset(
@@ -203,23 +209,23 @@ def fit_laplace(
         grid_dim=config.grid_dim_init,
         prng_key=jax.random.PRNGKey(94709),
         num_cameras=num_cameras,
-        # ggn_diag=None,
     )
     train_state = experiment.restore_checkpoint(train_state)
     
     hessian_state: HessianState
     hessian_state = HessianState.initialize(
         config,
-        # appearance_mlp=train_state.appearance_mlp,
         learnable_params=train_state.learnable_params,
         num_cameras=num_cameras,
         prng_key=jax.random.PRNGKey(94709),
     )
+    
 
     dataloader = fifteen.data.InMemoryDataLoader(
         dataset=dataset.get_training_rays(),
-        minibatch_size=config.minibatch_size,
+        minibatch_size=minibatch_size,
     )
+    print("mini batch size:", minibatch_size)
     minibatches = fifteen.data.cycled_minibatches(dataloader, shuffle_seed=0)
     minibatches = iter(minibatches)
 
@@ -232,16 +238,18 @@ def fit_laplace(
     ):
         # Load minibatch.
         minibatch = next(minibatches)
-        assert minibatch.get_batch_axes() == (config.minibatch_size,)
-        assert minibatch.colors.shape == (config.minibatch_size, 3)
+        assert minibatch.get_batch_axes() == (minibatch_size,)
+        assert minibatch.colors.shape == (minibatch_size, 3)
         
-        # Training step.
-        # log_data: fifteen.experiments.TensorboardLogData
-        hessian_state, ggn_diag = hessian_state.fit_hessian_step(minibatch)
-        # hessian_state.ggn_diag += ggn_diag
-        
-    experiment.save_checkpoint(
-        hessian_state,
-        step=int(hessian_state.step),
-        keep_every_n_steps=2000,
-    )
+        # Fit step.
+        hessian_state = hessian_state.fit_hessian_step(minibatch)
+
+        # Log & checkpoint.
+        hessian_step = int(hessian_state.step)
+
+        if hessian_step % 1000 == 0:
+            hessian_experiment.save_checkpoint(
+                hessian_state,
+                step=hessian_step,
+                keep_every_n_steps=2000,
+            )

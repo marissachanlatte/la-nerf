@@ -7,6 +7,7 @@ jaxlie
 jax_dataclasses>=1.5.1
 optax>=0.1.2
 tqdm
+Pillow
 # tensorflow is needed for tensorboard logging in JAX
 tensorflow
 git+https://github.com/brentyi/fifteen.git

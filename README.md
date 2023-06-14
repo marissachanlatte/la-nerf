@@ -58,11 +58,26 @@ dataset:
    tensorboard --logdir=./runs/
    ```
 
-5. To render:
+5. To fit the hessian:
+
+    ```bash
+    python ./posthoc_lego.py --config.run-dir "runs/lego-2023-06-13-12:29:08"
+    ```
+# TODO: implement with non-linearized volume rendering
+
+6. To render:
 
    ```bash
    python ./render_360.py --help
+   python ./render_360.py --run-dir "runs/lego-2023-06-13-12:29:08" --mode "RGB" --output-dir "renders/lego/rgb"
+  python ./render_360.py --run-dir "runs/lego-2023-06-13-12:29:08" --mode "DIST_MEDIAN" --output-dir "renders/lego/dist_median"
+  python ./render_360.py --run-dir "runs/lego-2023-06-13-12:29:08" --mode "UNCERTAINTIES_DENSITIES" --output-dir "renders/lego/uncertainties_densities"
    ```
+
+## Render uncertainties
+
+* sample parameters -> render with these parameters -> compute uncertainty of renders
+* sample parameters -> compute uncertainty of 3D points -> render uncertainty of 3D points
 
 ## Differences from the PyTorch implementation
 

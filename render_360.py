@@ -28,6 +28,8 @@ import tensorf.data
 import tensorf.render
 import tensorf.train_config
 import tensorf.training
+import tensorf.laplace
+from tensorf.render import RenderMode
 
 
 @dataclasses.dataclass
@@ -56,6 +58,12 @@ class Args:
 
     rotation_axis: Literal["world_z", "camera_up"] = "camera_up"
 
+    linearized_laplace: bool = False
+    """Whether to use the linearized Laplace approximation or MC."""
+
+    n_samples: int = 10
+    """Number of samples to use for MC."""
+
 
 def main(args: Args) -> None:
     experiment = fifteen.experiments.Experiment(data_dir=args.run_dir)
@@ -73,6 +81,15 @@ def main(args: Args) -> None:
     )
     train_state = experiment.restore_checkpoint(train_state)
     assert train_state.step > 0
+
+    hessian_experiment = fifteen.experiments.Experiment(data_dir=config.run_dir / "hessian")
+    hessian_state = tensorf.laplace.HessianState.initialize(
+        config,
+        learnable_params=train_state.learnable_params,
+        num_cameras=experiment.read_metadata("num_cameras", int),
+        prng_key=jax.random.PRNGKey(94709),
+    )
+    hessian_state = hessian_experiment.restore_checkpoint(hessian_state)
 
     # Load the training dataset... we're only going to use this to grab a camera.
     dataset = tensorf.data.make_dataset(
@@ -113,8 +130,8 @@ def main(args: Args) -> None:
     del train_cameras
 
     # Used for distance rendering.
-    min_invdist = None
-    max_invdist = None
+    min_ = None
+    max_ = None
 
     for i in range(args.frames):
         print(f"Rendering frame {i + 1}/{args.frames}")
@@ -123,6 +140,7 @@ def main(args: Args) -> None:
         rendered = tensorf.render.render_rays_batched(
             appearance_mlp=train_state.appearance_mlp,
             learnable_params=train_state.learnable_params,
+            hessian_params=hessian_state.JtJe,
             aabb=train_state.aabb,
             rays_wrt_world=camera.pixel_rays_wrt_world(
                 camera_index=args.render_camera_index
@@ -134,30 +152,50 @@ def main(args: Args) -> None:
                 mode=args.mode,
                 density_samples_per_ray=args.density_samples_per_ray,
                 appearance_samples_per_ray=args.appearance_samples_per_ray,
+                linearized_laplace=args.linearized_laplace,
+                n_samples=args.n_samples,
             ),
             batch_size=args.ray_batch_size,
         )
-        if len(rendered.shape) == 3:
+        if args.mode is RenderMode.RGB:
             # RGB: (H, W, 3)
             image = onp.array(rendered)
             image = onp.clip(image * 255.0, 0.0, 255.0).astype(onp.uint8)
-        else:
+        elif args.mode is RenderMode.DIST_MEDIAN or args.mode is RenderMode.DIST_MEAN:
             # Visualizing rendered distances: (H, W)
-            # For this we use inverse distances, which is similar to disparity.
+            # For this we use inverse distances, which is similar to disparity.            
             image = onp.array(rendered)
 
             # Visualization heuristics for "depths".
             image = 1.0 / onp.maximum(image, 1e-4)
 
             # Compute scaling terms using first frame.
-            if min_invdist is None or max_invdist is None:
-                min_invdist = image.min()
-                max_invdist = image.max() * 0.9
+            if min_ is None or max_ is None:
+                min_ = image.min()
+                max_ = image.max() * 0.9
 
-            image -= min_invdist
-            image /= max_invdist - min_invdist
+            image -= min_
+            image /= max_ - min_
             image = onp.clip(image * 255.0, 0.0, 255.0).astype(onp.uint8)
             image = onp.tile(image[:, :, None], reps=(1, 1, 3))
+        elif args.mode is RenderMode.UNCERTAINTIES_DENSITIES:
+            # Visualizing rendered distances: (H, W)
+            image = onp.array(rendered)
+            print("min and max: ", image.min(), image.max())
+
+            # Compute scaling terms using first frame.
+            if min_ is None or max_ is None:
+                min_ = image.min()
+                max_ = image.max() * 0.9
+
+            image -= min_
+            image /= max_ - min_
+            image = onp.clip(image * 255.0, 0.0, 255.0).astype(onp.uint8)
+            image = onp.tile(image[:, :, None], reps=(1, 1, 3))
+        elif args.mode is RenderMode.UNCERTAINTIES_RGB:
+            pass
+        else:
+            assert_never(args.mode)
 
         Image.fromarray(image).save(args.output_dir / f"image_{i:03}.png")
 

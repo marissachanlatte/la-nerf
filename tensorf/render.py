@@ -22,6 +22,8 @@ class RenderMode(enum.Enum):
     RGB = enum.auto()
     DIST_MEDIAN = enum.auto()
     DIST_MEAN = enum.auto()
+    UNCERTAINTIES_RGB = enum.auto()
+    UNCERTAINTIES_DENSITIES = enum.auto()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -36,6 +38,12 @@ class RenderConfig:
     appearance_samples_per_ray: int
     """Number of points to sample appearances at."""
 
+    linearized_laplace: bool
+    """Whether to use the linearized Laplace approximation or MC."""
+
+    n_samples: int
+    """Number of samples to use for MC."""
+
 
 @jdc.pytree_dataclass
 class LearnableParams:
@@ -48,16 +56,17 @@ class LearnableParams:
 
 
 def render_rays_batched(
-    appearance_mlp: networks.FeatureMlp,
-    learnable_params: LearnableParams,
-    aabb: jnp.ndarray,
-    rays_wrt_world: cameras.Rays3D,
-    prng_key: Optional[jax.random.KeyArray],
-    config: RenderConfig,
-    *,
-    batch_size: int = 4096,
-    use_tqdm: bool = True,
-) -> onp.ndarray:
+        appearance_mlp: networks.FeatureMlp,
+        learnable_params: LearnableParams,
+        aabb: jnp.ndarray,
+        rays_wrt_world: cameras.Rays3D,
+        prng_key: Optional[jax.random.KeyArray],
+        config: RenderConfig,
+        *,
+        batch_size: int = 4096,
+        use_tqdm: bool = True,
+        hessian_params: Optional[LearnableParams] = None,
+    ) -> onp.ndarray:
     """Render rays. Supports arbitrary batch axes (helpful for inputs with both height
     and width leading axes), and automatically splits rays into batches to prevent
     out-of-memory errors.
@@ -88,6 +97,7 @@ def render_rays_batched(
             render_rays(
                 appearance_mlp=appearance_mlp,
                 learnable_params=learnable_params,
+                hessian_params=hessian_params,
                 aabb=aabb,
                 rays_wrt_world=batch,
                 prng_key=prng_key,
@@ -95,7 +105,7 @@ def render_rays_batched(
             )
         )
     out_concatenated = onp.concatenate(out, axis=0)
-
+    
     # Reshape, with generalization to both (*,) for depths and (*, 3) for RGB.
     return out_concatenated.reshape(batch_axes + out_concatenated.shape[1:])
 
@@ -110,11 +120,12 @@ def render_rays(
     config: jdc.Static[RenderConfig],
     *,
     dtype: jdc.Static[Any] = jnp.float32,
+    hessian_params: Optional[LearnableParams] = None,
 ) -> jnp.ndarray:
     """Render a set of rays.
 
     Output should have shape `(ray_count, 3)`."""
-
+    
     # Cast everything to the desired dtype.
     learnable_params, aabb, rays_wrt_world = jax.tree_map(
         lambda x: x.astype(dtype) if jnp.issubdtype(jnp.floating, dtype) else x,
@@ -202,16 +213,49 @@ def render_rays(
     assert points.shape == (3, ray_count, config.density_samples_per_ray)
 
     # Pull interpolated density features out of tensor decomposition.
-    density_feat = learnable_params.density_tensor.interpolate(points)
-    assert density_feat.shape == (
-        density_feat.shape[0],
-        ray_count,
-        config.density_samples_per_ray,
-    )
+    if hessian_params is None:
+        density_feat = learnable_params.density_tensor.interpolate(points)
+        assert density_feat.shape == (
+            density_feat.shape[0],
+            ray_count,
+            config.density_samples_per_ray,
+        )
 
-    # Density from features.
-    sigmas = jax.nn.softplus(jnp.sum(density_feat, axis=0) + 10.0)
-    assert sigmas.shape == (ray_count, config.density_samples_per_ray)
+        # Density from features.
+        sigmas = jax.nn.softplus(jnp.sum(density_feat, axis=0) + 10.0)
+        assert sigmas.shape == (ray_count, config.density_samples_per_ray)
+    else:        
+        if config.linearized_laplace:
+            pass
+
+        else: # mc sampling
+            for i in range(config.n_samples):
+                sample_prng_key = jax.random.split(sample_prng_key)[0]
+                sampled_params = jax.tree_map(lambda x, y: x + 1.0/(jnp.sqrt(jax.nn.relu(y)) + 1e-6) * jax.random.normal(sample_prng_key, shape=x.shape, dtype=x.dtype), learnable_params, hessian_params) 
+                density_feat = sampled_params.density_tensor.interpolate(points)
+                
+                assert density_feat.shape == (
+                    density_feat.shape[0],
+                    ray_count,
+                    config.density_samples_per_ray,
+                )
+
+                # Density from features.
+                sigmas = jax.nn.softplus(jnp.sum(density_feat, axis=0) + 10.0)
+                assert sigmas.shape == (ray_count, config.density_samples_per_ray)
+
+                if i == 0:
+                    sigmas_sum = sigmas
+                    sigmas_sum2 = sigmas**2
+                else:
+                    sigmas_sum += sigmas
+                    sigmas_sum2 += sigmas**2
+
+            sigmas = sigmas_sum / config.n_samples
+            sigmas2 = sigmas_sum2 / config.n_samples
+            sigma_var = sigmas2 - sigmas**2
+
+            assert sigma_var.shape == (ray_count, config.density_samples_per_ray)
 
     # Compute segment probabilities for each ray.
     probs = compute_segment_probabilities(sigmas, step_sizes)
@@ -288,7 +332,22 @@ def render_rays(
         )
         assert sample_distances.shape == p_terminates_padded.shape
         return jnp.sum(p_terminates_padded * sample_distances, axis=-1)
+    
+    elif config.mode is RenderMode.UNCERTAINTIES_RGB:
+        # here we again need to sample learnable parameters
+        # compute rgb for each sample
+        # compute mean over samples
+        # compute variance of samples
+        # then render out the uncertainty of the rgb values
+        pass
 
+    elif config.mode is RenderMode.UNCERTAINTIES_DENSITIES:
+        # Compute uncertainties via expected value.
+        
+        expected_uncertainty = (
+            jnp.sum(sigma_var * probs.p_terminates, axis=-1)
+        )
+        return expected_uncertainty
     else:
         assert False
 
