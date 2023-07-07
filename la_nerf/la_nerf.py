@@ -58,13 +58,11 @@ class LaNerfModel(NerfactoModel):
             max_res=self.config.max_res,
             log2_hashmap_size=self.config.log2_hashmap_size,
             hidden_dim_color=self.config.hidden_dim_color,
-            hidden_dim_transient=self.config.hidden_dim_transient,
             spatial_distortion=scene_contraction,
             num_images=self.num_train_data,
             use_pred_normals=self.config.predict_normals,
             use_average_appearance_embedding=self.config.use_average_appearance_embedding,
             appearance_embedding_dim=self.config.appearance_embed_dim,
-            implementation=self.config.implementation,
         )
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
