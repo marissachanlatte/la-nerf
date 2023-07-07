@@ -131,21 +131,6 @@ class LaNerfactoField(Field):
         )
         self.mlp_base = torch.nn.Sequential(self.mlp_base_grid, self.mlp_base_mlp)
 
-        # predicted normals
-        if self.use_pred_normals:
-            self.mlp_pred_normals = MLP(
-                in_dim=self.geo_feat_dim + self.position_encoding.get_out_dim(),
-                num_layers=3,
-                layer_width=64,
-                out_dim=hidden_dim_transient,
-                activation=nn.ReLU(),
-                out_activation=None,
-                implementation=implementation,
-            )
-            self.field_head_pred_normals = PredNormalsFieldHead(
-                in_dim=self.mlp_pred_normals.get_out_dim()
-            )
-
         self.mlp_head = MLP(
             in_dim=self.direction_encoding.get_out_dim()
             + self.geo_feat_dim
