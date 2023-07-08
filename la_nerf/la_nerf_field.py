@@ -11,18 +11,29 @@ from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.field_components.activations import trunc_exp
 from nerfstudio.field_components.embedding import Embedding
 from nerfstudio.field_components.encodings import HashEncoding, NeRFEncoding, SHEncoding
-from nerfstudio.field_components.field_heads import (
-    FieldHeadNames,
-    PredNormalsFieldHead,
-    SemanticFieldHead,
-    TransientDensityFieldHead,
-    TransientRGBFieldHead,
-    UncertaintyFieldHead,
-)
+from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.mlp import MLP
 from nerfstudio.field_components.spatial_distortions import SpatialDistortion
 from nerfstudio.fields.base_field import Field, shift_directions_for_tcnn
 from torch import Tensor, nn
+
+from torch.nn.utils import parameters_to_vector
+
+import nnj
+import pytorch_laplace
+
+
+def get_mlp(in_dim, hidden_dim, out_dim, num_layers, activation, out_activation):
+
+    layers = [nn.Linear(in_dim, hidden_dim)]
+    layers.append(activation)
+    for _ in range(num_layers):
+        layers.append(nn.Linear(hidden_dim, hidden_dim))
+        layers.append(activation)
+    layers.append(nn.Linear(hidden_dim, out_dim))
+    layers.append(out_activation)
+
+    return nn.Sequential(*layers)
 
 
 class LaNerfactoField(Field):
@@ -44,11 +55,12 @@ class LaNerfactoField(Field):
         appearance_embedding_dim: dimension of appearance embedding
         transient_embedding_dim: dimension of transient embedding
         use_transient_embedding: whether to use transient embedding
-        use_semantics: whether to use semantic segmentation
-        num_semantic_classes: number of semantic classes
-        use_pred_normals: whether to use predicted normals
         use_average_appearance_embedding: whether to use average appearance embedding or zeros for inference
         spatial_distortion: spatial distortion to apply to the scene
+        laplace_backend: which laplace backend to use
+        laplace_method: which laplace method to use
+        laplace_num_samples: number of samples to use for laplace
+        laplace_hessian_shape: shape of the hessian to use for laplace
     """
 
     aabb: Tensor
@@ -67,15 +79,14 @@ class LaNerfactoField(Field):
         num_layers_color: int = 3,
         features_per_level: int = 2,
         hidden_dim_color: int = 64,
-        hidden_dim_transient: int = 64,
         appearance_embedding_dim: int = 32,
         use_transient_embedding: bool = False,
-        use_semantics: bool = False,
-        pass_semantic_gradients: bool = False,
-        use_pred_normals: bool = False,
         use_average_appearance_embedding: bool = False,
         spatial_distortion: Optional[SpatialDistortion] = None,
-        implementation: Literal["tcnn", "torch"] = "torch",
+        laplace_backend: Literal["pytorch-laplace", "laplace-redux"]="pytorch-laplace",
+        laplace_method: Literal["laplace", "linearized-laplace"]="linearized-laplace",
+        laplace_num_samples: int = 10,
+        laplace_hessian_shape: Literal["diag", "kron", "full"]="diag",
     ) -> None:
         super().__init__()
 
@@ -94,14 +105,11 @@ class LaNerfactoField(Field):
         )
         self.use_average_appearance_embedding = use_average_appearance_embedding
         self.use_transient_embedding = use_transient_embedding
-        self.use_semantics = use_semantics
-        self.use_pred_normals = use_pred_normals
-        self.pass_semantic_gradients = pass_semantic_gradients
         self.base_res = base_res
 
         self.direction_encoding = SHEncoding(
             levels=4,
-            implementation=implementation,
+            implementation="tcnn",
         )
 
         self.position_encoding = NeRFEncoding(
@@ -109,7 +117,7 @@ class LaNerfactoField(Field):
             num_frequencies=2,
             min_freq_exp=0,
             max_freq_exp=2 - 1,
-            implementation=implementation,
+            implementation="tcnn",
         )
 
         self.mlp_base_grid = HashEncoding(
@@ -127,22 +135,48 @@ class LaNerfactoField(Field):
             out_dim=1 + self.geo_feat_dim,
             activation=nn.ReLU(),
             out_activation=None,
-            implementation=implementation,
+            implementation="tcnn",
         )
         self.mlp_base = torch.nn.Sequential(self.mlp_base_grid, self.mlp_base_mlp)
 
-        self.mlp_head = MLP(
-            in_dim=self.direction_encoding.get_out_dim()
-            + self.geo_feat_dim
-            + self.appearance_embedding_dim,
-            num_layers=num_layers_color,
-            layer_width=hidden_dim_color,
+        self.mlp_head = get_mlp(
+            self.direction_encoding.get_out_dim() + self.geo_feat_dim + self.appearance_embedding_dim, 
+            hidden_dim_color, 
             out_dim=3,
-            activation=nn.ReLU(),
+            num_layers=num_layers_color, 
+            activation=nn.ReLU(), 
             out_activation=nn.Sigmoid(),
-            implementation=implementation,
         )
 
+
+        self.laplace_backend = laplace_backend
+        self.laplace_method = laplace_method
+        self.laplace_num_samples = laplace_num_samples
+        self.laplace_hessian_shape = laplace_hessian_shape
+
+        if self.laplace_backend == "pytorch-laplace":
+
+            # initialize hessian
+            self.hessian = 10**6 * torch.ones_like(
+                parameters_to_vector(self.mlp_head.parameters()), 
+                device="cuda:0"
+            )
+
+            # convert to nnj.Sequential
+            self.mlp_head = nnj.utils.convert_to_nnj(self.mlp_head)
+
+            # initalize hessian calculator and sampler
+            self.hessian_calculator = pytorch_laplace.MSEHessianCalculator(
+                hessian_shape=laplace_hessian_shape,
+                approximation_accuracy="exact",
+            )
+            self.la_sampler = pytorch_laplace.DiagLaplace(
+                backend="nnj",
+            )
+
+        else:
+            raise NotImplementedError
+            
     def get_density(self, ray_samples: RaySamples) -> Tuple[Tensor, Tensor]:
         """Computes and returns the densities."""
         if self.spatial_distortion is not None:
@@ -202,22 +236,6 @@ class LaNerfactoField(Field):
                     device=directions.device,
                 )
 
-        # predicted normals
-        if self.use_pred_normals:
-            positions = ray_samples.frustums.get_positions()
-
-            positions_flat = self.position_encoding(positions.view(-1, 3))
-            pred_normals_inp = torch.cat(
-                [positions_flat, density_embedding.view(-1, self.geo_feat_dim)], dim=-1
-            )
-
-            x = (
-                self.mlp_pred_normals(pred_normals_inp)
-                .view(*outputs_shape, -1)
-                .to(directions)
-            )
-            outputs[FieldHeadNames.PRED_NORMALS] = self.field_head_pred_normals(x)
-
         h = torch.cat(
             [
                 d,
@@ -226,7 +244,43 @@ class LaNerfactoField(Field):
             ],
             dim=-1,
         )
-        rgb = self.mlp_head(h).view(*outputs_shape, -1).to(directions)
-        outputs.update({FieldHeadNames.RGB: rgb})
+
+
+        if self.laplace_backend == "pytorch-laplace" and not self.train:
+
+            if self.laplace_method == "laplace":
+                rgb, rgb_sigma = self.la_sampler.laplace(
+                    x=h,
+                    model=self.mlp_head,
+                    hessian=self.hessian,
+                    n_samples=1 if self.training else self.laplace_num_samples,
+                )
+            elif self.laplace_method == "linearized-laplace":
+                rgb, rgb_sigma = self.la_sampler.linearized_laplace(
+                    x=h,
+                    model=self.mlp_head,
+                    hessian=self.hessian,
+                )
+
+
+            outputs.update({"rgb_sigma": rgb_sigma.view(*outputs_shape, -1).to(directions)})
+            outputs.update({FieldHeadNames.RGB: rgb.view(*outputs_shape, -1).to(directions)})
+        elif self.laplace_backend == "laplace-redux" and not self.train:
+            raise NotImplementedError
+        else:
+            rgb = self.mlp_head(h).view(*outputs_shape, -1).to(directions)
+            outputs.update({FieldHeadNames.RGB: rgb})
+
+        if self.train:
+            # update hessian estimate
+
+            with torch.no_grad():
+                hessian_batch = self.hessian_calculator.compute_hessian(
+                    x=h,
+                    # val=rgb, TODO: this is not needed for the hessian
+                    model=self.mlp_head,
+                )
+                # momentum like update
+                self.hessian = 0.999 * self.hessian + hessian_batch
 
         return outputs

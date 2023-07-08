@@ -1,0 +1,15 @@
+[project]
+name = "la_nerf"
+version = "0.1.1"
+
+dependencies=[
+    "nerfstudio>=0.3.0",
+    "pytorch-laplace@git+https://github.com/frederikwarburg/pytorch-laplace.git",
+    "laplace-torch",
+]
+
+[tool.setuptools.packages.find]
+include = ["la_nerf*"]
+
+[project.entry-points.'nerfstudio.method_configs']
+la_nerf = 'la_nerf.la_nerf_config:la_nerf_method'

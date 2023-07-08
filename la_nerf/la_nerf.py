@@ -13,6 +13,7 @@ from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.spatial_distortions import SceneContraction
 from nerfstudio.model_components.losses import interlevel_loss
 from nerfstudio.models.nerfacto import NerfactoModel, NerfactoModelConfig
+from nerfstudio.model_components.renderers import UncertaintyRenderer
 
 from la_nerf.la_nerf_field import LaNerfactoField
 
@@ -24,16 +25,16 @@ class LaNerfModelConfig(NerfactoModelConfig):
     _target: Type = field(default_factory=lambda: LaNerfModel)
 
     # laplace backend
-    backend: Literal["laplace-redux", "pytorch-laplace"] = "pytorch-laplace"
+    laplace_backend: Literal["laplace-redux", "pytorch-laplace"] = "pytorch-laplace"
 
     # laplace method
     laplace_method: Literal["laplace", "linerized-laplace"] = "laplace"
 
-    # number of samples
-    num_laplace_samples: int = 100
+    # number of samples for laplace
+    laplace_num_samples: int = 100
 
     # hessian shape
-    hessian_shape: Literal["diag", "kron", "full"] = "diag"
+    laplace_hessian_shape: Literal["diag", "kron", "full"] = "diag"
 
 
 class LaNerfModel(NerfactoModel):
@@ -60,10 +61,15 @@ class LaNerfModel(NerfactoModel):
             hidden_dim_color=self.config.hidden_dim_color,
             spatial_distortion=scene_contraction,
             num_images=self.num_train_data,
-            use_pred_normals=self.config.predict_normals,
             use_average_appearance_embedding=self.config.use_average_appearance_embedding,
             appearance_embedding_dim=self.config.appearance_embed_dim,
+            laplace_backend=self.config.laplace_backend,
+            laplace_method=self.config.laplace_method,
+            laplace_num_samples=self.config.laplace_num_samples,
+            laplace_hessian_shape=self.config.laplace_hessian_shape,
         )
+
+        self.renderer_uq = UncertaintyRenderer()
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None):
         loss_dict = {}
@@ -121,7 +127,7 @@ class LaNerfModel(NerfactoModel):
         )
         ray_samples_list.append(ray_samples)
 
-        _, outputs, weights = self._get_outputs_nerfacto(ray_samples)
+        field_outputs, outputs, weights = self._get_outputs_nerfacto(ray_samples)
 
         weights_list.append(weights)
         if self.training:
@@ -131,5 +137,9 @@ class LaNerfModel(NerfactoModel):
             outputs[f"prop_depth_{i}"] = self.renderer_depth(
                 weights=weights_list[i], ray_samples=ray_samples_list[i]
             )
+
+        if "rgb_sigma" in field_outputs:
+            uq_rgb = self.renderer_uq(beta=field_outputs["rgb_sigma"].sum(-1), weights=weights)
+            outputs["uq_rgb"] = uq_rgb
 
         return outputs
