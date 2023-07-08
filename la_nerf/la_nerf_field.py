@@ -31,7 +31,9 @@ def get_mlp(in_dim, hidden_dim, out_dim, num_layers, activation, out_activation)
         layers.append(nn.Linear(hidden_dim, hidden_dim))
         layers.append(activation)
     layers.append(nn.Linear(hidden_dim, out_dim))
-    layers.append(out_activation)
+
+    if out_activation is not None:
+        layers.append(out_activation)
 
     return nn.Sequential(*layers)
 
@@ -120,7 +122,7 @@ class LaNerfactoField(Field):
             implementation="tcnn",
         )
 
-        self.mlp_base_grid = HashEncoding(
+        self.base_grid = HashEncoding(
             num_levels=num_levels,
             min_res=base_res,
             max_res=max_res,
@@ -128,18 +130,17 @@ class LaNerfactoField(Field):
             features_per_level=features_per_level,
             implementation="tcnn",
         )
-        self.mlp_base_mlp = MLP(
-            in_dim=self.mlp_base_grid.get_out_dim(),
-            num_layers=num_layers,
-            layer_width=hidden_dim,
+
+        self.density_mlp = get_mlp(
+            self.base_grid.get_out_dim(),
+            hidden_dim,
             out_dim=1 + self.geo_feat_dim,
+            num_layers=num_layers,
             activation=nn.ReLU(),
             out_activation=None,
-            implementation="tcnn",
         )
-        self.mlp_base = torch.nn.Sequential(self.mlp_base_grid, self.mlp_base_mlp)
 
-        self.mlp_head = get_mlp(
+        self.rgb_mlp = get_mlp(
             self.direction_encoding.get_out_dim() + self.geo_feat_dim + self.appearance_embedding_dim, 
             hidden_dim_color, 
             out_dim=3,
@@ -158,12 +159,17 @@ class LaNerfactoField(Field):
 
             # initialize hessian
             self.hessian = 10**6 * torch.ones_like(
-                parameters_to_vector(self.mlp_head.parameters()), 
+                parameters_to_vector(self.rgb_mlp.parameters()), 
+                device="cuda:0"
+            )
+            self.density_hessian = 10**6 * torch.ones_like(
+                parameters_to_vector(self.density_mlp.parameters()),
                 device="cuda:0"
             )
 
             # convert to nnj.Sequential
-            self.mlp_head = nnj.utils.convert_to_nnj(self.mlp_head)
+            self.rgb_mlp = nnj.utils.convert_to_nnj(self.rgb_mlp)
+            self.density_mlp = nnj.utils.convert_to_nnj(self.density_mlp)
 
             # initalize hessian calculator and sampler
             self.hessian_calculator = pytorch_laplace.MSEHessianCalculator(
@@ -181,6 +187,36 @@ class LaNerfactoField(Field):
         # if the we are not in training, but the last call was in training,
         # we need to resample parameters.
         self.resample_parameters = True
+        self.resample_density_parameters = True
+
+    def forward(self, ray_samples: RaySamples, compute_normals: bool = False) -> Dict[FieldHeadNames, Tensor]:
+        """Evaluates the field at points along the ray.
+
+        Args:
+            ray_samples: Samples to evaluate field on.
+        """
+        if compute_normals:
+            with torch.enable_grad():
+                density, density_embedding, density_mu, density_sigma = self.get_density(ray_samples)
+                raise NotImplementedError
+        else:
+            density, density_embedding, density_mu, density_sigma = self.get_density(ray_samples)
+
+        field_outputs = self.get_outputs(ray_samples, density_embedding=density_embedding)
+        field_outputs[FieldHeadNames.DENSITY] = density  # type: ignore
+
+        if density_mu is not None:
+            field_outputs["density_mu"] = density_mu  # type: ignore
+
+        if density_sigma is not None:
+            field_outputs["density_sigma"] = density_sigma  # type: ignore
+
+        if compute_normals:
+            with torch.enable_grad():
+                normals = self.get_normals()
+            field_outputs[FieldHeadNames.NORMALS] = normals  # type: ignore
+        return field_outputs
+
             
     def get_density(self, ray_samples: RaySamples) -> Tuple[Tensor, Tensor]:
         """Computes and returns the densities."""
@@ -199,9 +235,11 @@ class LaNerfactoField(Field):
         if not self._sample_locations.requires_grad:
             self._sample_locations.requires_grad = True
         positions_flat = positions.view(-1, 3)
-        h = self.mlp_base(positions_flat).view(*ray_samples.frustums.shape, -1)
+        grid_features = self.base_grid(positions_flat)
+        h = self.density_mlp(grid_features)
+        h_flat = h.view(*ray_samples.frustums.shape, -1)
         density_before_activation, base_mlp_out = torch.split(
-            h, [1, self.geo_feat_dim], dim=-1
+            h_flat, [1, self.geo_feat_dim], dim=-1
         )
         self._density_before_activation = density_before_activation
 
@@ -210,7 +248,60 @@ class LaNerfactoField(Field):
         # from smaller internal (float16) parameters.
         density = trunc_exp(density_before_activation.to(positions))
         density = density * selector[..., None]
-        return density, base_mlp_out
+
+        # laplace approximation on the densities
+        if not self.training:
+
+            if self.laplace_backend == "pytorch-laplace":
+                if self.laplace_method == "laplace":
+                    
+                    # resample weights from posterior
+                    if self.resample_density_parameters:
+                        sigma_q = self.la_sampler.posterior_scale(hessian=self.density_hessian)
+                        mu_q = parameters_to_vector(self.density_mlp.parameters())
+                        self.density_weight_samples = self.la_sampler.sample_from_normal(mu_q, sigma_q, self.laplace_num_samples)
+                        self.resample_density_parameters = False
+
+                    # compute mean and variance in output space 
+                    # from sampled weights
+                    h_mu, h_sigma = self.la_sampler.normal_from_samples(x=grid_features, samples=self.density_weight_samples, model=self.density_mlp)
+                    density_before_activation_mu, _ = torch.split(h_mu, [1, self.geo_feat_dim], dim=-1)
+                    density_before_activation_sigma, _ = torch.split(h_sigma, [1, self.geo_feat_dim], dim=-1)
+
+                    density_mu = trunc_exp(density_before_activation_mu.to(positions))
+                    density_sigma = trunc_exp(density_before_activation_sigma.to(positions))
+
+                    density_mu = density_mu * selector[..., None]
+                    density_sigma = density_sigma * selector[..., None]
+
+                elif self.laplace_method == "linearized-laplace":
+                    raise NotImplementedError
+
+            elif self.laplace_backend == "laplace-redux":
+                raise NotImplementedError
+        
+        else:
+            density_mu, density_sigma = None, None
+
+            # we are currently in training mode, 
+            # next time we are not, then we need to resample parameters
+            self.resample_density_parameters = True
+            
+            if self.laplace_backend == "pytorch-laplace":
+                # update hessian estimate
+                with torch.no_grad():
+                    hessian_batch = self.hessian_calculator.compute_hessian(
+                        x=grid_features,
+                        val=h,
+                        model=self.density_mlp,
+                    )
+                    # momentum like update
+                    self.density_hessian = 0.999 * self.density_hessian + hessian_batch
+
+            elif self.laplace_backend == "laplace-redux":
+                raise NotImplementedError
+
+        return density, base_mlp_out, density_mu, density_sigma
 
     def get_outputs(
         self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None
@@ -250,9 +341,10 @@ class LaNerfactoField(Field):
             dim=-1,
         )
 
-        rgb = self.mlp_head(h)
+        rgb = self.rgb_mlp(h)
         outputs.update({FieldHeadNames.RGB: rgb.view(*outputs_shape, -1).to(directions)})
 
+        # laplace approximation on the rgb values
         if not self.training:
 
             if self.laplace_backend == "pytorch-laplace":
@@ -261,18 +353,18 @@ class LaNerfactoField(Field):
                     # resample weights from posterior
                     if self.resample_parameters:
                         sigma_q = self.la_sampler.posterior_scale(hessian=self.hessian)
-                        mu_q = parameters_to_vector(self.mlp_head.parameters())
+                        mu_q = parameters_to_vector(self.rgb_mlp.parameters())
                         self.weight_samples = self.la_sampler.sample_from_normal(mu_q, sigma_q, self.laplace_num_samples)
                         self.resample_parameters = False
 
                     # compute mean and variance in output space 
                     # from sampled weights
-                    rgb_mu, rgb_sigma = self.la_sampler.normal_from_samples(x=h, samples=self.weight_samples, model=self.mlp_head)
+                    rgb_mu, rgb_sigma = self.la_sampler.normal_from_samples(x=h, samples=self.weight_samples, model=self.rgb_mlp)
 
                 elif self.laplace_method == "linearized-laplace":
                     rgb_mu, rgb_sigma = self.la_sampler.linearized_laplace(
                         x=h,
-                        model=self.mlp_head,
+                        model=self.rgb_mlp,
                         hessian=self.hessian,
                     )
 
@@ -293,7 +385,7 @@ class LaNerfactoField(Field):
                     hessian_batch = self.hessian_calculator.compute_hessian(
                         x=h,
                         val=rgb,
-                        model=self.mlp_head,
+                        model=self.rgb_mlp,
                     )
                     # momentum like update
                     self.hessian = 0.999 * self.hessian + hessian_batch

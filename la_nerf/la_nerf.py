@@ -146,4 +146,8 @@ class LaNerfModel(NerfactoModel):
             rgb_sigma = self.renderer_uq(betas=field_outputs["rgb_sigma"].sum(-1, keepdim=True), weights=weights)
             outputs["rgb_sigma"] = rgb_sigma
 
+        if "density_sigma" in field_outputs:
+            density_sigma = self.renderer_uq(betas=field_outputs["density_sigma"].sum(-1, keepdim=True), weights=weights)
+            outputs["density_sigma"] = density_sigma
+            
         return outputs
