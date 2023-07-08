@@ -25,10 +25,10 @@ class LaNerfModelConfig(NerfactoModelConfig):
     _target: Type = field(default_factory=lambda: LaNerfModel)
 
     # laplace backend
-    laplace_backend: Literal["laplace-redux", "pytorch-laplace"] = "pytorch-laplace"
+    laplace_backend: Literal["laplace-redux", "pytorch-laplace", "none"] = "pytorch-laplace"
 
     # laplace method
-    laplace_method: Literal["laplace", "linerized-laplace"] = "laplace"
+    laplace_method: Literal["laplace", "linearized-laplace"] = "laplace"
 
     # number of samples for laplace
     laplace_num_samples: int = 100
@@ -138,8 +138,12 @@ class LaNerfModel(NerfactoModel):
                 weights=weights_list[i], ray_samples=ray_samples_list[i]
             )
 
+        if "rgb_mu" in field_outputs:
+            rgb_mu = self.renderer_rgb(rgb=field_outputs["rgb_mu"], weights=weights)
+            outputs["rgb_mu"] = rgb_mu
+
         if "rgb_sigma" in field_outputs:
-            uq_rgb = self.renderer_uq(beta=field_outputs["rgb_sigma"].sum(-1), weights=weights)
-            outputs["uq_rgb"] = uq_rgb
+            rgb_sigma = self.renderer_uq(betas=field_outputs["rgb_sigma"].sum(-1, keepdim=True), weights=weights)
+            outputs["rgb_sigma"] = rgb_sigma
 
         return outputs

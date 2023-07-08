@@ -83,7 +83,7 @@ class LaNerfactoField(Field):
         use_transient_embedding: bool = False,
         use_average_appearance_embedding: bool = False,
         spatial_distortion: Optional[SpatialDistortion] = None,
-        laplace_backend: Literal["pytorch-laplace", "laplace-redux"]="pytorch-laplace",
+        laplace_backend: Literal["pytorch-laplace", "laplace-redux","none"]="pytorch-laplace",
         laplace_method: Literal["laplace", "linearized-laplace"]="linearized-laplace",
         laplace_num_samples: int = 10,
         laplace_hessian_shape: Literal["diag", "kron", "full"]="diag",
@@ -174,8 +174,13 @@ class LaNerfactoField(Field):
                 backend="nnj",
             )
 
-        else:
+        elif self.laplace_backend == "laplace-redux":
             raise NotImplementedError
+
+        # parameter to keep track of when to resample parameters.
+        # if the we are not in training, but the last call was in training,
+        # we need to resample parameters.
+        self.resample_parameters = True
             
     def get_density(self, ray_samples: RaySamples) -> Tuple[Tensor, Tensor]:
         """Computes and returns the densities."""
@@ -245,42 +250,55 @@ class LaNerfactoField(Field):
             dim=-1,
         )
 
+        rgb = self.mlp_head(h)
+        outputs.update({FieldHeadNames.RGB: rgb.view(*outputs_shape, -1).to(directions)})
 
-        if self.laplace_backend == "pytorch-laplace" and not self.train:
+        if not self.training:
 
-            if self.laplace_method == "laplace":
-                rgb, rgb_sigma = self.la_sampler.laplace(
-                    x=h,
-                    model=self.mlp_head,
-                    hessian=self.hessian,
-                    n_samples=1 if self.training else self.laplace_num_samples,
-                )
-            elif self.laplace_method == "linearized-laplace":
-                rgb, rgb_sigma = self.la_sampler.linearized_laplace(
-                    x=h,
-                    model=self.mlp_head,
-                    hessian=self.hessian,
-                )
+            if self.laplace_backend == "pytorch-laplace":
+                if self.laplace_method == "laplace":
+                    
+                    # resample weights from posterior
+                    if self.resample_parameters:
+                        sigma_q = self.la_sampler.posterior_scale(hessian=self.hessian)
+                        mu_q = parameters_to_vector(self.mlp_head.parameters())
+                        self.weight_samples = self.la_sampler.sample_from_normal(mu_q, sigma_q, self.laplace_num_samples)
+                        self.resample_parameters = False
 
+                    # compute mean and variance in output space 
+                    # from sampled weights
+                    rgb_mu, rgb_sigma = self.la_sampler.normal_from_samples(x=h, samples=self.weight_samples, model=self.mlp_head)
 
-            outputs.update({"rgb_sigma": rgb_sigma.view(*outputs_shape, -1).to(directions)})
-            outputs.update({FieldHeadNames.RGB: rgb.view(*outputs_shape, -1).to(directions)})
-        elif self.laplace_backend == "laplace-redux" and not self.train:
-            raise NotImplementedError
+                elif self.laplace_method == "linearized-laplace":
+                    rgb_mu, rgb_sigma = self.la_sampler.linearized_laplace(
+                        x=h,
+                        model=self.mlp_head,
+                        hessian=self.hessian,
+                    )
+
+                outputs.update({"rgb_sigma": rgb_sigma.view(*outputs_shape, -1).to(directions)})
+                outputs.update({"rgb_mu": rgb_mu.view(*outputs_shape, -1).to(directions)})
+
+            elif self.laplace_backend == "laplace-redux":
+                raise NotImplementedError
+        
         else:
-            rgb = self.mlp_head(h).view(*outputs_shape, -1).to(directions)
-            outputs.update({FieldHeadNames.RGB: rgb})
+            # we are currently in training mode, 
+            # next time we are not, then we need to resample parameters
+            self.resample_parameters = True
+            
+            if self.laplace_backend == "pytorch-laplace":
+                # update hessian estimate
+                with torch.no_grad():
+                    hessian_batch = self.hessian_calculator.compute_hessian(
+                        x=h,
+                        val=rgb,
+                        model=self.mlp_head,
+                    )
+                    # momentum like update
+                    self.hessian = 0.999 * self.hessian + hessian_batch
 
-        if self.train:
-            # update hessian estimate
-
-            with torch.no_grad():
-                hessian_batch = self.hessian_calculator.compute_hessian(
-                    x=h,
-                    # val=rgb, TODO: this is not needed for the hessian
-                    model=self.mlp_head,
-                )
-                # momentum like update
-                self.hessian = 0.999 * self.hessian + hessian_batch
+            elif self.laplace_backend == "laplace-redux":
+                raise NotImplementedError
 
         return outputs
