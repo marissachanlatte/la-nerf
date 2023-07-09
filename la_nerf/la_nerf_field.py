@@ -132,8 +132,8 @@ class LaNerfactoField(Field):
         )
 
         self.density_mlp = get_mlp(
-            self.base_grid.get_out_dim(),
-            hidden_dim,
+            in_dim=self.base_grid.get_out_dim(),
+            hidden_dim=hidden_dim,
             out_dim=1 + self.geo_feat_dim,
             num_layers=num_layers,
             activation=nn.ReLU(),
@@ -141,14 +141,13 @@ class LaNerfactoField(Field):
         )
 
         self.rgb_mlp = get_mlp(
-            self.direction_encoding.get_out_dim() + self.geo_feat_dim + self.appearance_embedding_dim, 
-            hidden_dim_color, 
+            in_dim=self.direction_encoding.get_out_dim() + self.geo_feat_dim + self.appearance_embedding_dim, 
+            hidden_dim=hidden_dim_color, 
             out_dim=3,
             num_layers=num_layers_color, 
             activation=nn.ReLU(), 
             out_activation=nn.Sigmoid(),
         )
-
 
         self.laplace_backend = laplace_backend
         self.laplace_method = laplace_method
@@ -235,7 +234,7 @@ class LaNerfactoField(Field):
         if not self._sample_locations.requires_grad:
             self._sample_locations.requires_grad = True
         positions_flat = positions.view(-1, 3)
-        grid_features = self.base_grid(positions_flat)
+        grid_features = self.base_grid(positions_flat).float()
         h = self.density_mlp(grid_features)
         h_flat = h.view(*ray_samples.frustums.shape, -1)
         density_before_activation, base_mlp_out = torch.split(
@@ -250,6 +249,7 @@ class LaNerfactoField(Field):
         density = density * selector[..., None]
 
         # laplace approximation on the densities
+        density_mu, density_sigma = None, None
         if not self.training:
 
             if self.laplace_backend == "pytorch-laplace":
@@ -284,8 +284,6 @@ class LaNerfactoField(Field):
                 raise NotImplementedError
         
         else:
-            density_mu, density_sigma = None, None
-
             # we are currently in training mode, 
             # next time we are not, then we need to resample parameters
             self.resample_density_parameters = True
@@ -295,7 +293,7 @@ class LaNerfactoField(Field):
                 with torch.no_grad():
                     hessian_batch = self.hessian_calculator.compute_hessian(
                         x=grid_features,
-                        val=h,
+                        # val=h,
                         model=self.density_mlp,
                     )
                     # momentum like update
