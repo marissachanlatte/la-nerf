@@ -254,6 +254,7 @@ class LaNerfactoField(Field):
 
             if self.laplace_backend == "pytorch-laplace":
                 if self.laplace_method == "laplace":
+                    density_mu, density_sigma = None, None
                     
                     # resample weights from posterior
                     if self.resample_density_parameters:
@@ -265,8 +266,10 @@ class LaNerfactoField(Field):
                     # compute mean and variance in output space 
                     # from sampled weights
                     h_mu, h_sigma = self.la_sampler.normal_from_samples(x=grid_features, samples=self.density_weight_samples, model=self.density_mlp)
-                    density_before_activation_mu, _ = torch.split(h_mu, [1, self.geo_feat_dim], dim=-1)
-                    density_before_activation_sigma, _ = torch.split(h_sigma, [1, self.geo_feat_dim], dim=-1)
+                    h_mu_flat = h_mu.view(*ray_samples.frustums.shape, -1)
+                    h_sigma_flat = h_sigma.view(*ray_samples.frustums.shape, -1)
+                    density_before_activation_mu, _ = torch.split(h_mu_flat, [1, self.geo_feat_dim], dim=-1)
+                    density_before_activation_sigma, _ = torch.split(h_sigma_flat, [1, self.geo_feat_dim], dim=-1)
 
                     density_mu = trunc_exp(density_before_activation_mu.to(positions))
                     density_sigma = trunc_exp(density_before_activation_sigma.to(positions))
