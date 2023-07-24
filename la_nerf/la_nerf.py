@@ -25,7 +25,7 @@ class LaNerfModelConfig(NerfactoModelConfig):
     _target: Type = field(default_factory=lambda: LaNerfModel)
 
     # laplace backend
-    laplace_backend: Literal["laplace-redux", "pytorch-laplace", "none"] = "pytorch-laplace"
+    laplace_backend: Literal["nnj", "backpack", "none"] = "nnj"
 
     # laplace method
     laplace_method: Literal["laplace", "linearized-laplace"] = "laplace"
